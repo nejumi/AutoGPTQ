@@ -1,6 +1,8 @@
-import math
 import os
 import time
+import datetime
+import math
+import gc
 from logging import getLogger
 
 import torch
@@ -9,9 +11,12 @@ import transformers
 
 from .quantizer import Quantizer
 
+# wandbのインポート
+import wandb
 
 logger = getLogger(__name__)
 
+# TensorFloat-32を無効化（必要に応じて）
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -54,10 +59,11 @@ class GPTQ:
             inp = inp.flatten(1)
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
-        # inp = inp.float()
         inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
+        del inp
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def fasterquant(
         self,
@@ -113,10 +119,14 @@ class GPTQ:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
+
+        # HをGPU上で処理
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+
+        import gc  # ガベージコレクタのインポート
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -160,6 +170,12 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
+            # 不要なオブジェクトの削除とメモリの解放
+            del W1, Q1, Err1, Losses1, Hinv1, err1
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.synchronize()  # メモリの解放を待つ
+
             if os.environ.get("DEBUG"):
                 self.layer.weight.data[:, :i2] = Q[:, :i2]
                 self.layer.weight.data[:, i2:] = W[:, i2:]
@@ -167,8 +183,16 @@ class GPTQ:
                 logger.debug(torch.sum(Losses))
 
         torch.cuda.synchronize()
-        logger.info(f"duration: {(time.time() - tick)}")
-        logger.info(f"avg loss: {torch.sum(Losses).item() / self.nsamples}")
+        duration = time.time() - tick
+        avg_loss = torch.sum(Losses).item() / self.nsamples
+
+        logger.info(f"duration: {duration}")
+        logger.info(f"avg loss: {avg_loss}")
+
+        wandb.log({
+            f'layer_{self.layer}_avg_loss': avg_loss,
+            f'layer_{self.layer}_duration': duration,
+        })
 
         group_size = group_size if group_size != -1 else self.columns
         if static_groups and actorder:
@@ -191,16 +215,24 @@ class GPTQ:
             zero.append(self.quantizer.zero)
         scale = torch.cat(scale, dim=1)
         zero = torch.cat(zero, dim=1)
+
+        # スケール値とゼロポイントをwandbにログ
+        wandb.log({
+            f'layer_{self.layer}_scale_mean': scale.mean().item(),
+            f'layer_{self.layer}_zero_point_mean': zero.mean().item()
+        })
+
         return scale, zero, g_idx
 
     def free(self):
-        if os.environ.get("DEBUG"):
-            self.inp1 = None
-            self.out1 = None
-        self.H = None
-        self.Losses = None
-        self.Trace = None
-        torch.cuda.empty_cache()
+        with torch.no_grad():
+            if os.environ.get("DEBUG"):
+                self.inp1 = None
+                self.out1 = None
+            self.H = None
+            self.quantizer = None
+            torch.cuda.empty_cache()
+            gc.collect()
 
 
 __all__ = ["GPTQ"]
